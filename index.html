@@ -163,6 +163,16 @@ input:focus {
     border-radius: 4px;
 }
 
+.engine-option.sugg-toggle {
+    border-top: 1px solid #3a3a55;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+body.light .engine-option.sugg-toggle {
+    border-top-color: #e5deff;
+}
+
 /* Suggestions */
 #suggestions {
     position: absolute;
@@ -226,6 +236,13 @@ input:focus {
     margin-bottom: 6px;
     background: #2a2a3d;
     padding: 6px;
+}
+
+.quick-links .site-name {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .quick-links .visits {
@@ -362,11 +379,11 @@ function setEngine(name, persist = true) {
         try {
             localStorage.setItem(ENGINE_STORAGE_KEY, name);
         } catch (e) {
-            // localStorage indisponible (ex: aperçu Claude.ai) : on continue
-            // simplement sans sauvegarde persistante.
+            // localStorage indisponible : on continue sans sauvegarde persistante.
         }
     }
 
+    cancelSuggestions();
     closeEngineMenu();
 }
 
@@ -397,35 +414,103 @@ document.addEventListener("click", (e) => {
 });
 
 /* ---------- Recherche + suggestions ---------- */
+
+/* Échappe le texte avant de l'insérer dans du HTML (anti-XSS) */
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 function escapeRegExp(str) {
     return str.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
 }
 
+/* Met en gras la partie tapée, en échappant tout le reste */
 function highlightMatch(text, query) {
-    if (!query) return text;
+    if (!query) return escapeHtml(text);
     const regex = new RegExp("(" + escapeRegExp(query) + ")", "ig");
-    return text.replace(regex, "<strong>$1</strong>");
+    return text
+        .split(regex)
+        .map((part, i) => i % 2 === 1
+            ? "<strong>" + escapeHtml(part) + "</strong>"
+            : escapeHtml(part))
+        .join("");
 }
 
-function suggestCallback(data) {
-    if (!data || !data[1]) return;
-    showSuggestions(data[1]);
+/* Chaque moteur n'interroge QUE son propre service de suggestions.
+   Ecosia n'a pas d'API publique de suggestions : aucune requête n'est envoyée. */
+const SUGGEST_PROVIDERS = {
+    google: {
+        url: (q, cb) => "https://suggestqueries.google.com/complete/search?client=firefox&q="
+            + encodeURIComponent(q) + "&callback=" + cb,
+        parse: d => d && d[1]
+    },
+    bing: {
+        url: (q, cb) => "https://api.bing.com/osjson.aspx?query="
+            + encodeURIComponent(q) + "&JsonType=callback&JsonCallback=" + cb,
+        parse: d => d && d[1]
+    },
+    duckduckgo: {
+        url: (q, cb) => "https://duckduckgo.com/ac/?q="
+            + encodeURIComponent(q) + "&callback=" + cb,
+        parse: d => Array.isArray(d) ? d.map(x => x.phrase) : []
+    },
+    wikipedia: {
+        url: (q, cb) => "https://fr.wikipedia.org/w/api.php?action=opensearch&format=json&limit=6&namespace=0&search="
+            + encodeURIComponent(q) + "&callback=" + cb,
+        parse: d => d && d[1]
+    }
+    // ecosia : volontairement absent
+};
+
+const SUGGEST_STORAGE_KEY = "junenet_suggestions_enabled";
+const SUGGEST_DELAY_MS = 150;
+
+let suggestionsEnabled = true;
+let suggestTimer = null;
+let suggestRequestId = 0;
+let selectedIndex = -1;
+
+/* Annule tout ce qui est en attente et ignore les réponses tardives */
+function cancelSuggestions() {
+    clearTimeout(suggestTimer);
+    suggestTimer = null;
+    suggestRequestId++;
+    hideSuggestions();
 }
 
 function fetchSuggestions(q) {
-    const old = document.getElementById("jsonp");
-    if (old) old.remove();
+    const provider = SUGGEST_PROVIDERS[currentEngine];
+    if (!suggestionsEnabled || !provider) {
+        hideSuggestions();
+        return;
+    }
 
+    const id = ++suggestRequestId;
+    const cbName = "__suggest_cb_" + id;
     const script = document.createElement("script");
-    script.id = "jsonp";
-    script.src =
-        "https://suggestqueries.google.com/complete/search" +
-        "?client=firefox&q=" + encodeURIComponent(q) +
-        "&callback=suggestCallback";
+
+    const cleanup = () => {
+        delete window[cbName];
+        script.remove();
+    };
+
+    window[cbName] = function (data) {
+        cleanup();
+        if (id !== suggestRequestId) return; // réponse périmée : on l'ignore
+        let list = [];
+        try { list = provider.parse(data) || []; } catch (e) { list = []; }
+        showSuggestions(list.filter(t => typeof t === "string" && t));
+    };
+
+    script.onerror = cleanup;
+    script.src = provider.url(q, cbName);
     document.body.appendChild(script);
 }
-
-let selectedIndex = -1;
 
 function showSuggestions(list) {
     const box = document.getElementById("suggestions");
@@ -436,7 +521,7 @@ function showSuggestions(list) {
     list.slice(0, 6).forEach(text => {
         const div = document.createElement("div");
         div.className = "suggestion";
-        div.innerHTML = highlightMatch(text, q);
+        div.innerHTML = highlightMatch(text, q); // texte échappé par highlightMatch
         div.onclick = () => search(text);
         box.appendChild(div);
     });
@@ -452,17 +537,48 @@ function hideSuggestions() {
 function search(value = null) {
     const q = value || document.getElementById("q").value.trim();
     if (!q) return;
-    hideSuggestions();
+    cancelSuggestions();
     window.location.href = ENGINES[currentEngine].url + encodeURIComponent(q);
 }
 
 function onInput(e) {
     const q = e.value.trim();
+    clearTimeout(suggestTimer);
+
     if (!q) {
-        hideSuggestions();
+        cancelSuggestions();
         return;
     }
-    fetchSuggestions(q);
+
+    // Debounce : on attend la fin de la frappe avant d'interroger le moteur
+    suggestTimer = setTimeout(() => fetchSuggestions(q), SUGGEST_DELAY_MS);
+}
+
+/* ---------- Activer / désactiver les suggestions ---------- */
+function updateSuggToggle() {
+    const el = document.getElementById("sugg-toggle");
+    if (el) {
+        el.textContent = "Suggestions : " + (suggestionsEnabled ? "activées ✓" : "désactivées");
+    }
+}
+
+function toggleSuggestions(event) {
+    if (event) event.stopPropagation();
+    suggestionsEnabled = !suggestionsEnabled;
+    try {
+        localStorage.setItem(SUGGEST_STORAGE_KEY, suggestionsEnabled ? "1" : "0");
+    } catch (e) {}
+    if (!suggestionsEnabled) cancelSuggestions();
+    updateSuggToggle();
+}
+
+function loadSuggestionsPref() {
+    try {
+        suggestionsEnabled = localStorage.getItem(SUGGEST_STORAGE_KEY) !== "0";
+    } catch (e) {
+        suggestionsEnabled = true;
+    }
+    updateSuggToggle();
 }
 
 /* Navigation au clavier dans les suggestions */
@@ -518,24 +634,78 @@ function toggleTheme() {
    Les données proviennent du véritable historique de navigation de
    JuneNet, via un pont QWebChannel exposé par l'application Python
    (voir la classe Bridge dans JuneNet.py). */
+
+/* Domaines entiers à ne pas proposer comme "sites visités" */
+const HIDDEN_DOMAINS = ["ecosia.org"];
+
+/* Pages précises à masquer (page d'accueil / nouvel onglet de JuneNet) */
+const HIDDEN_URLS = [
+    "https://onelevel-studio.github.io/junenet"
+];
+
+function normalizeUrl(url) {
+    return (url || "")
+        .toLowerCase()
+        .replace(/^http:\/\//, "https://")
+        .replace(/[?#].*$/, "")
+        .replace(/\/+$/, "");
+}
+
+function getHost(site) {
+    let host = site.domain;
+    if (!host) {
+        try { host = new URL(site.url).hostname; } catch (e) { host = ""; }
+    }
+    return host.replace(/^www\./, "").toLowerCase();
+}
+
+function isHidden(site) {
+    const host = getHost(site);
+    if (HIDDEN_DOMAINS.some(d => host === d || host.endsWith("." + d))) {
+        return true;
+    }
+
+    const url = normalizeUrl(site.url);
+    return HIDDEN_URLS.some(h => {
+        const hidden = normalizeUrl(h);
+        return url === hidden || url.startsWith(hidden + "/");
+    });
+}
+
+/* Nom court dérivé du domaine : "www.youtube.com" -> "Youtube" */
+function siteName(site) {
+    const parts = getHost(site).split(".").filter(Boolean);
+    if (!parts.length) return site.url;
+    let name = parts.length === 1 ? parts[0] : parts[parts.length - 2];
+    // gère les cas type "bbc.co.uk"
+    if (parts.length > 2 && name.length <= 3) name = parts[parts.length - 3];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
 function renderTopSites(sites) {
     const container = document.getElementById("top-sites");
     container.innerHTML = "";
 
-    if (!sites || !sites.length) {
-        return;
-    }
+    if (!sites || !sites.length) return;
 
-    sites.forEach(site => {
+    sites.filter(site => !isHidden(site)).forEach(site => {
         const a = document.createElement("a");
         a.href = site.url;
         a.target = "_self";
         a.title = site.url;
-        a.innerHTML = `
-            <img src="https://www.google.com/s2/favicons?sz=64&domain=${site.domain}">
-            <span>${site.title}</span>
-            <span class="visits">${site.visits} visite${site.visits > 1 ? "s" : ""}</span>
-        `;
+
+        const img = document.createElement("img");
+        img.src = "https://www.google.com/s2/favicons?sz=64&domain=" + encodeURIComponent(getHost(site));
+
+        const name = document.createElement("span");
+        name.className = "site-name";
+        name.textContent = siteName(site);
+
+        const visits = document.createElement("span");
+        visits.className = "visits";
+        visits.textContent = site.visits + " visite" + (site.visits > 1 ? "s" : "");
+
+        a.append(img, name, visits);
         container.appendChild(a);
     });
 }
@@ -565,6 +735,7 @@ function initBridge() {
 window.addEventListener("load", () => {
     updateClock();
     setInterval(updateClock, 30000);
+    loadSuggestionsPref();
     loadSavedEngine();
     initBridge();
 });
@@ -608,6 +779,9 @@ window.addEventListener("load", () => {
                 </div>
                 <div class="engine-option" data-engine="ecosia" onclick="setEngine('ecosia')">
                     <img src="https://www.google.com/s2/favicons?sz=64&domain=ecosia.org"> Ecosia
+                </div>
+                <div class="engine-option sugg-toggle" id="sugg-toggle" onclick="toggleSuggestions(event)">
+                    Suggestions : activées ✓
                 </div>
             </div>
         </div>
